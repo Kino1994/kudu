@@ -55,6 +55,17 @@ service TabletServerService {
   rpc Checksum(ChecksumRequestPB) returns (ChecksumResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeClient";
   }
+
+  // Delete all rows in a tablet matching a primary key prefix.
+  //
+  // The server scans for rows whose leading PK columns match the provided
+  // prefix, then deletes them internally. This avoids requiring the client
+  // to perform a scan + individual deletes round-trip.
+  rpc DeleteByPkPrefix(DeleteByPkPrefixRequestPB)
+      returns (DeleteByPkPrefixResponsePB) {
+    option (kudu.rpc.track_rpc_result) = true;
+    option (kudu.rpc.authz_method) = "AuthorizeClient";
+  }
 }
 
 message ChecksumRequestPB {

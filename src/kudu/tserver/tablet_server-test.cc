@@ -5447,5 +5447,152 @@ TEST_F(OpPrepareQueueTest, RequestTimesOutInPrepareQueue) {
   ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
 }
 
+// --------------------------------------------------------------------------
+// DeleteByPkPrefix RPC tests
+// --------------------------------------------------------------------------
+
+// Helper to build a DeleteByPkPrefixRequestPB for the test schema.
+// The test schema has a single PK column (key INT32), so the "prefix"
+// is just the key value itself.
+static void BuildDeleteByPkPrefixRequest(
+    const string& tablet_id,
+    const Schema& schema,
+    int32_t key_value,
+    DeleteByPkPrefixRequestPB* req) {
+  req->set_tablet_id(tablet_id);
+
+  // Build a prefix schema with just the key column.
+  // Use SCHEMA_PB_WITHOUT_IDS since client requests must not include IDs.
+  Schema prefix_schema = schema.CreateKeyProjection();
+  ASSERT_OK(SchemaToPB(prefix_schema, req->mutable_schema(), SCHEMA_PB_WITHOUT_IDS));
+
+  // Encode the prefix row as a RANGE_LOWER_BOUND.
+  KuduPartialRow prefix_row(&prefix_schema);
+  CHECK_OK(prefix_row.SetInt32(0, key_value));
+  RowOperationsPBEncoder encoder(req->mutable_pk_prefix());
+  encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, prefix_row);
+}
+
+TEST_F(TabletServerTest, TestDeleteByPkPrefixBasic) {
+  // Insert 10 rows (keys 0-9).
+  InsertTestRowsRemote(0, 10);
+
+  // Delete the row with key=5 via DeleteByPkPrefix RPC.
+  DeleteByPkPrefixRequestPB req;
+  DeleteByPkPrefixResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromSeconds(10));
+
+  NO_FATALS(BuildDeleteByPkPrefixRequest(kTabletId, schema_, 5, &req));
+  ASSERT_OK(proxy_->DeleteByPkPrefix(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << SecureShortDebugString(resp);
+  ASSERT_EQ(1, resp.rows_deleted());
+
+  // Verify 9 rows remain and key=5 is gone.
+  vector<string> results;
+  ScanResponsePB scan_resp;
+  NO_FATALS(OpenScannerWithAllColumns(&scan_resp));
+  NO_FATALS(DrainScannerToStrings(scan_resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(9, results.size());
+  for (const auto& row_str : results) {
+    ASSERT_EQ(string::npos, row_str.find("key=5")) << "Found deleted row: " << row_str;
+  }
+}
+
+TEST_F(TabletServerTest, TestDeleteByPkPrefixEmptyResult) {
+  // Insert rows with keys 0-4.
+  InsertTestRowsRemote(0, 5);
+
+  // Try to delete key=999, which does not exist.
+  DeleteByPkPrefixRequestPB req;
+  DeleteByPkPrefixResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromSeconds(10));
+
+  NO_FATALS(BuildDeleteByPkPrefixRequest(kTabletId, schema_, 999, &req));
+  ASSERT_OK(proxy_->DeleteByPkPrefix(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << SecureShortDebugString(resp);
+  ASSERT_EQ(0, resp.rows_deleted());
+
+  // Verify all 5 rows remain.
+  vector<string> results;
+  ScanResponsePB scan_resp;
+  NO_FATALS(OpenScannerWithAllColumns(&scan_resp));
+  NO_FATALS(DrainScannerToStrings(scan_resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(5, results.size());
+}
+
+TEST_F(TabletServerTest, TestDeleteByPkPrefixUnlimited) {
+  // Insert 100 rows (keys 0-99).
+  InsertTestRowsRemote(0, 100);
+
+  // Delete all rows with key=50.
+  DeleteByPkPrefixRequestPB req;
+  DeleteByPkPrefixResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromSeconds(10));
+
+  NO_FATALS(BuildDeleteByPkPrefixRequest(kTabletId, schema_, 50, &req));
+  ASSERT_OK(proxy_->DeleteByPkPrefix(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << SecureShortDebugString(resp);
+  ASSERT_EQ(1, resp.rows_deleted());
+
+  // Verify 99 rows remain.
+  vector<string> results;
+  ScanResponsePB scan_resp;
+  NO_FATALS(OpenScannerWithAllColumns(&scan_resp));
+  NO_FATALS(DrainScannerToStrings(scan_resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(99, results.size());
+}
+
+TEST_F(TabletServerTest, TestDeleteByPkPrefixMissingFields) {
+  // Send a request with no schema and no pk_prefix — should fail.
+  DeleteByPkPrefixRequestPB req;
+  DeleteByPkPrefixResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromSeconds(10));
+
+  req.set_tablet_id(kTabletId);
+  // Don't set schema or pk_prefix.
+
+  ASSERT_OK(proxy_->DeleteByPkPrefix(req, &resp, &controller));
+  ASSERT_TRUE(resp.has_error());
+  ASSERT_EQ(TabletServerErrorPB::INVALID_SCHEMA, resp.error().code());
+}
+
+TEST_F(TabletServerTest, TestDeleteByPkPrefixMultipleRows) {
+  // Insert rows with duplicate key values to verify bulk delete.
+  // Since the test schema has a single PK column, each key is unique.
+  // Insert 20 rows and delete one.
+  InsertTestRowsRemote(0, 20);
+
+  DeleteByPkPrefixRequestPB req;
+  DeleteByPkPrefixResponsePB resp;
+  rpc::RpcController controller;
+  controller.set_timeout(MonoDelta::FromSeconds(10));
+
+  // Delete key=0.
+  NO_FATALS(BuildDeleteByPkPrefixRequest(kTabletId, schema_, 0, &req));
+  ASSERT_OK(proxy_->DeleteByPkPrefix(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << SecureShortDebugString(resp);
+  ASSERT_EQ(1, resp.rows_deleted());
+
+  // Delete key=19.
+  controller.Reset();
+  resp.Clear();
+  req.Clear();
+  NO_FATALS(BuildDeleteByPkPrefixRequest(kTabletId, schema_, 19, &req));
+  ASSERT_OK(proxy_->DeleteByPkPrefix(req, &resp, &controller));
+  ASSERT_FALSE(resp.has_error()) << SecureShortDebugString(resp);
+  ASSERT_EQ(1, resp.rows_deleted());
+
+  // Verify 18 rows remain.
+  vector<string> results;
+  ScanResponsePB scan_resp;
+  NO_FATALS(OpenScannerWithAllColumns(&scan_resp));
+  NO_FATALS(DrainScannerToStrings(scan_resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(18, results.size());
+}
+
 } // namespace tserver
 } // namespace kudu

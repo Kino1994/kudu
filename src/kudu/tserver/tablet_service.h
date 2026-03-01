@@ -92,6 +92,8 @@ class CoordinateTransactionRequestPB;
 class CoordinateTransactionResponsePB;
 class CreateTabletRequestPB;
 class CreateTabletResponsePB;
+class DeleteByPkPrefixRequestPB;
+class DeleteByPkPrefixResponsePB;
 class DeleteTabletRequestPB;
 class DeleteTabletResponsePB;
 class ParticipantRequestPB;
@@ -149,6 +151,12 @@ class TabletServiceImpl : public TabletServerServiceIf {
   void Checksum(const ChecksumRequestPB* req,
                 ChecksumResponsePB* resp,
                 rpc::RpcContext* context) override;
+
+  // Delete all rows matching a primary key prefix within a single tablet.
+  // Performs an internal scan + delete for each matching row.
+  void DeleteByPkPrefix(const DeleteByPkPrefixRequestPB* req,
+                        DeleteByPkPrefixResponsePB* resp,
+                        rpc::RpcContext* context) override;
 
   bool SupportsFeature(uint32_t feature) const override;
 

@@ -528,6 +528,71 @@ message SplitKeyRangeResponsePB {
   repeated KeyRangePB ranges = 2;
 }
 
+// Delete all rows in a tablet matching a primary key prefix.
+//
+// The server performs an internal scan using the encoded PK prefix bounds,
+// then applies DELETE_IGNORE mutations for every matching row through the
+// normal write/consensus path.
+//
+// Consistency:
+//  - Per-tablet snapshot consistency: rows to delete are determined by an
+//    MVCC snapshot taken at the start of the operation on each tablet. Rows
+//    inserted after the snapshot are NOT deleted.
+//  - Per-tablet non-atomicity: deletes are applied in batches through Raft.
+//    Each batch is individually atomic; the full operation within a tablet
+//    is NOT a single atomic transaction.
+//  - Cross-tablet non-atomicity: one RPC per tablet; no cross-tablet
+//    atomicity. Use transactions if needed.
+//  - Concurrent deletes: uses DELETE_IGNORE internally so concurrent
+//    deletes of the same rows are harmless (no "not found" errors).
+//  - Retry safety: RPC result tracking (track_rpc_result = true) enables
+//    server-side deduplication via request_id. If the server crashes
+//    mid-operation, retries re-execute from a fresh snapshot;
+//    already-deleted rows simply don't match the scan.
+//
+// Authorization: requires both scan and delete privileges on the table.
+//
+// Routing: the client is responsible for determining which tablets may
+// contain rows matching the prefix (taking hash and range partitioning
+// into account) and sending one DeleteByPkPrefix RPC per tablet.
+message DeleteByPkPrefixRequestPB {
+  // The tablet to delete from.
+  required bytes tablet_id = 1;
+
+  // The schema of the prefix columns (only the leading PK columns that
+  // form the prefix). Must be a leading subset of the table's PK schema.
+  optional SchemaPB schema = 2;
+
+  // The encoded prefix row. Only the leading PK columns should be set.
+  // Encoded using RowOperationsPB format with a single RANGE_LOWER_BOUND
+  // row containing the prefix column values.
+  optional RowOperationsPB pk_prefix = 3;
+
+  // The required consistency mode for this operation.
+  optional ExternalConsistencyMode external_consistency_mode = 5
+      [default = CLIENT_PROPAGATED];
+
+  // A timestamp obtained by the client from a previous request.
+  optional fixed64 propagated_timestamp = 6;
+
+  // An authorization token with which to authorize this request.
+  optional security.SignedTokenPB authz_token = 7;
+}
+
+message DeleteByPkPrefixResponsePB {
+  // If the overall request failed, this field will be set.
+  optional TabletServerErrorPB error = 1;
+
+  // Number of rows successfully deleted from this tablet.
+  optional int64 rows_deleted = 2;
+
+  // The timestamp chosen by the server for this operation.
+  optional fixed64 timestamp = 3;
+
+  // Resource consumption metrics.
+  optional ResourceMetricsPB resource_metrics = 4;
+}
+
 enum TabletServerFeatures {
   UNKNOWN_FEATURE = 0;
   COLUMN_PREDICATES = 1;
@@ -544,4 +609,6 @@ enum TabletServerFeatures {
   // Whether the server supports working with tables having one-dimensional
   // array type columns.
   ARRAY_1D_COLUMN_TYPE = 7;
+  // Whether the server supports DeleteByPkPrefix RPC.
+  DELETE_BY_PK_PREFIX = 8;
 }

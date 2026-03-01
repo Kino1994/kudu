@@ -36,6 +36,8 @@
 
 #include "kudu/clock/clock.h"
 #include "kudu/common/column_predicate.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/row_operations.h"
 #include "kudu/common/columnar_serialization.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/common/common.pb.h"
@@ -101,6 +103,7 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/tserver/tserver_service.pb.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/faststring.h"
@@ -239,6 +242,7 @@ using kudu::security::TokenPB;
 using kudu::security::TokenVerifier;
 using kudu::server::ServerBase;
 using kudu::tablet::AlterSchemaOpState;
+using kudu::tablet::LatchOpCompletionCallback;
 using kudu::tablet::MvccSnapshot;
 using kudu::tablet::OpCompletionCallback;
 using kudu::tablet::ParticipantOpState;
@@ -1771,6 +1775,433 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
     return SetupErrorAndRespond(
         resp->mutable_error(), s, TabletServerErrorPB::UNKNOWN_ERROR, context);
   }
+}
+
+void TabletServiceImpl::DeleteByPkPrefix(const DeleteByPkPrefixRequestPB* req,
+                                         DeleteByPkPrefixResponsePB* resp,
+                                         RpcContext* context) {
+  const auto& tablet_id = req->tablet_id();
+  TRACE_EVENT1("tserver", "TabletServiceImpl::DeleteByPkPrefix",
+               "tablet_id", tablet_id);
+  // 1. Tablet lookup.
+  scoped_refptr<TabletReplica> replica;
+  if (!LookupRunningTabletReplicaOrRespond(
+        server_->tablet_manager(), tablet_id, resp, context, &replica)) {
+    return;
+  }
+
+  // 2. Authorization: require both scan and delete privileges.
+  if (FLAGS_tserver_enforce_access_control) {
+    TokenPB token;
+    if (!VerifyAuthzTokenOrRespond(server_->token_verifier(), *req, context, &token)) {
+      return;
+    }
+    const auto& privilege = token.authz().table_privilege();
+    if (!CheckMatchingTableIdOrRespond(privilege, replica->tablet_metadata()->table_id(),
+                                       "DeleteByPkPrefix", context)) {
+      return;
+    }
+    if (!privilege.scan_privilege() || !privilege.delete_privilege()) {
+      context->RespondRpcFailure(ErrorStatusPB::FATAL_UNAUTHORIZED,
+          Status::NotAuthorized(
+              "not authorized: DeleteByPkPrefix requires both scan and delete privileges"));
+      return;
+    }
+  }
+
+  // 3. Get tablet reference.
+  shared_ptr<Tablet> tablet;
+  TabletServerErrorPB::Code error_code;
+  Status s = GetTabletRef(replica, &tablet, &error_code);
+  if (PREDICT_FALSE(!s.ok())) {
+    SetupErrorAndRespond(resp->mutable_error(), s, error_code, context);
+    return;
+  }
+
+  // 4. Pressure checks (same as Write RPC).
+  double capacity_pct;
+  if (process_memory::SoftLimitExceeded(&capacity_pct)) {
+    constexpr const char* const kMsg =
+        "rejecting DeleteByPkPrefix request: soft memory limit exceeded";
+    static const auto kStatus = Status::ServiceUnavailable(kMsg);
+    tablet->metrics()->leader_memory_pressure_rejections->Increment();
+    KLOG_EVERY_N_SECS(WARNING, 1) << kMsg << THROTTLE_MSG;
+    return SetupErrorAndRespond(resp->mutable_error(),
+                                kStatus,
+                                TabletServerErrorPB::THROTTLED,
+                                context);
+  }
+
+  // 5. Handle propagated timestamp.
+  if (req->has_propagated_timestamp()) {
+    Timestamp ts(req->propagated_timestamp());
+    s = server_->clock()->Update(ts);
+    if (PREDICT_FALSE(!s.ok())) {
+      return SetupErrorAndRespond(
+          resp->mutable_error(), s, TabletServerErrorPB::UNKNOWN_ERROR, context);
+    }
+  }
+
+  // 6. Decode the prefix row from the request.
+  const SchemaPtr tablet_schema_ptr = replica->tablet_metadata()->schema();
+  const Schema& tablet_schema = *tablet_schema_ptr;
+
+  if (!req->has_schema() || !req->has_pk_prefix()) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(),
+        Status::InvalidArgument("DeleteByPkPrefix requires 'schema' and 'pk_prefix' fields"),
+        TabletServerErrorPB::INVALID_SCHEMA,
+        context);
+  }
+
+  Schema client_schema;
+  s = SchemaFromPB(req->schema(), &client_schema);
+  if (PREDICT_FALSE(!s.ok())) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(), s, TabletServerErrorPB::INVALID_SCHEMA, context);
+  }
+  // Build a prefix schema with column IDs from the tablet schema.
+  // The client sends a prefix-only schema (subset of PK columns, no IDs).
+  // RowOperationsPBDecoder requires either (a) client==tablet pointer with IDs,
+  // or (b) client!=tablet which triggers CheckAllRequiredColumnsPresent().
+  // Since the prefix is intentionally a subset, option (b) would fail.
+  // So we build a schema with matching column IDs and use option (a).
+  vector<ColumnSchema> prefix_cols;
+  vector<ColumnId> prefix_col_ids;
+  for (int i = 0; i < client_schema.num_columns(); i++) {
+    const ColumnSchema& client_col = client_schema.column(i);
+    int tablet_col_idx = tablet_schema.find_column(client_col.name());
+    if (tablet_col_idx == Schema::kColumnNotFound) {
+      return SetupErrorAndRespond(
+          resp->mutable_error(),
+          Status::InvalidArgument(Substitute("prefix column '$0' not found in tablet schema",
+                                             client_col.name())),
+          TabletServerErrorPB::INVALID_SCHEMA,
+          context);
+    }
+    prefix_cols.push_back(tablet_schema.column(tablet_col_idx));
+    prefix_col_ids.push_back(tablet_schema.column_id(tablet_col_idx));
+  }
+  Schema prefix_schema(std::move(prefix_cols), std::move(prefix_col_ids),
+                        client_schema.num_key_columns());
+  Arena arena(1024);
+  RowOperationsPBDecoder decoder(&req->pk_prefix(), &prefix_schema, &prefix_schema, &arena);
+  vector<DecodedRowOperation> ops;
+  s = decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops);
+  if (PREDICT_FALSE(!s.ok())) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(),
+        s.CloneAndPrepend("failed to decode PK prefix"),
+        TabletServerErrorPB::INVALID_SCHEMA,
+        context);
+  }
+  if (ops.empty() || !ops[0].split_row) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(),
+        Status::InvalidArgument("DeleteByPkPrefix: no prefix row provided"),
+        TabletServerErrorPB::INVALID_SCHEMA,
+        context);
+  }
+  const KuduPartialRow& prefix_row = *ops[0].split_row;
+  // 7. Build ScanSpec with equality predicates on the prefix columns.
+  //    The prefix_row uses prefix_schema column indices (0..N-1).
+  //    Map each to the corresponding tablet schema column for predicates.
+  ScanSpec spec;
+  for (int i = 0; i < prefix_schema.num_columns(); i++) {
+    if (!prefix_row.IsColumnSet(i)) {
+      // Stop at the first unset column — the prefix must be a contiguous
+      // leading subset of the PK.
+      break;
+    }
+    // Map prefix column index to tablet schema column.
+    int tablet_col_idx = tablet_schema.find_column(prefix_schema.column(i).name());
+    DCHECK_NE(tablet_col_idx, Schema::kColumnNotFound);
+    const ColumnSchema& tablet_col = tablet_schema.column(tablet_col_idx);
+    // Extract the value from the prefix row and copy it into the arena.
+    const void* val = nullptr;
+    size_t size = tablet_col.type_info()->size();
+    if (tablet_col.type_info()->physical_type() == BINARY) {
+      Slice slice_val;
+      switch (tablet_col.type_info()->type()) {
+        case STRING:
+          s = prefix_row.GetString(i, &slice_val);
+          break;
+        case VARCHAR:
+          s = prefix_row.GetVarchar(i, &slice_val);
+          break;
+        default:
+          s = prefix_row.GetBinary(i, &slice_val);
+          break;
+      }
+      if (PREDICT_FALSE(!s.ok())) {
+        return SetupErrorAndRespond(
+            resp->mutable_error(),
+            s.CloneAndPrepend(Substitute("failed to get prefix value for column '$0'",
+                                         tablet_col.name())),
+            TabletServerErrorPB::INVALID_SCHEMA,
+            context);
+      }
+      auto* data_copy = static_cast<uint8_t*>(arena.AllocateBytes(slice_val.size()));
+      memcpy(data_copy, slice_val.data(), slice_val.size());
+      val = arena.NewObject<Slice>(data_copy, slice_val.size());
+    } else {
+      // Fixed-size types: allocate space in the arena and copy the value.
+      auto* data_copy = static_cast<uint8_t*>(arena.AllocateBytes(size));
+      // Use the typed getter to extract the value.
+      switch (tablet_col.type_info()->type()) {
+        case BOOL: {
+          bool v;
+          CHECK_OK(prefix_row.GetBool(i, &v));
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        case INT8: {
+          int8_t v;
+          CHECK_OK(prefix_row.GetInt8(i, &v));
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        case INT16: {
+          int16_t v;
+          CHECK_OK(prefix_row.GetInt16(i, &v));
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        case INT32:
+        case DATE: {
+          int32_t v;
+          if (tablet_col.type_info()->type() == DATE) {
+            CHECK_OK(prefix_row.GetDate(i, &v));
+          } else {
+            CHECK_OK(prefix_row.GetInt32(i, &v));
+          }
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        case INT64:
+        case UNIXTIME_MICROS: {
+          int64_t v;
+          if (tablet_col.type_info()->type() == UNIXTIME_MICROS) {
+            CHECK_OK(prefix_row.GetUnixTimeMicros(i, &v));
+          } else {
+            CHECK_OK(prefix_row.GetInt64(i, &v));
+          }
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        case FLOAT: {
+          float v;
+          CHECK_OK(prefix_row.GetFloat(i, &v));
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        case DOUBLE: {
+          double v;
+          CHECK_OK(prefix_row.GetDouble(i, &v));
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        case INT128: {
+          int128_t v;
+          CHECK_OK(prefix_row.GetUnscaledDecimal(i, &v));
+          memcpy(data_copy, &v, size);
+          break;
+        }
+        default:
+          return SetupErrorAndRespond(
+              resp->mutable_error(),
+              Status::InvalidArgument(Substitute("unsupported PK column type: $0",
+                                                 tablet_col.type_info()->name())),
+              TabletServerErrorPB::INVALID_SCHEMA,
+              context);
+      }
+      val = data_copy;
+    }
+    spec.AddPredicate(ColumnPredicate::Equality(tablet_col, val));
+  }
+
+  // 8. Build PK-only projection schema (without column IDs, as required
+  //    by VerifyProjectionCompatibility for user-facing operations).
+  vector<ColumnSchema> key_cols;
+  for (int i = 0; i < tablet_schema.num_key_columns(); i++) {
+    key_cols.push_back(tablet_schema.column(i));
+  }
+  Schema projection(std::move(key_cols), tablet_schema.num_key_columns());
+
+  // 9. Create an MVCC snapshot iterator.
+  tablet::RowIteratorOptions opts;
+  opts.projection = &projection;
+  opts.snap_to_include = MvccSnapshot(*tablet->mvcc_manager());
+
+  unique_ptr<RowwiseIterator> iter;
+  s = tablet->NewRowIterator(std::move(opts), &iter);
+  if (PREDICT_FALSE(!s.ok())) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(), s, TabletServerErrorPB::UNKNOWN_ERROR, context);
+  }
+  s = iter->Init(&spec);
+  if (PREDICT_FALSE(!s.ok())) {
+    return SetupErrorAndRespond(
+        resp->mutable_error(), s, TabletServerErrorPB::UNKNOWN_ERROR, context);
+  }
+
+  // 10. Scan and batch delete loop.
+  static const int kDeleteBatchSize = 128;
+  int64_t total_deleted = 0;
+
+  RowBlockMemory mem(32 * 1024);
+  RowBlock block(&projection, kDeleteBatchSize, &mem);
+
+  while (iter->HasNext()) {
+    mem.Reset();
+    s = iter->NextBlock(&block);
+    if (PREDICT_FALSE(!s.ok())) {
+      return SetupErrorAndRespond(
+          resp->mutable_error(), s, TabletServerErrorPB::UNKNOWN_ERROR, context);
+    }
+
+    // Collect row indices to delete from this block.
+    vector<size_t> rows_to_delete;
+    rows_to_delete.reserve(block.nrows());
+    for (size_t i = 0; i < block.nrows(); i++) {
+      if (!block.selection_vector()->IsRowSelected(i)) {
+        continue;
+      }
+      rows_to_delete.push_back(i);
+    }
+
+    if (rows_to_delete.empty()) {
+      continue;
+    }
+
+    // Build a WriteRequestPB with DELETE_IGNORE operations for the collected rows.
+    WriteRequestPB write_req;
+    write_req.set_tablet_id(tablet_id.data(), tablet_id.size());
+    DCHECK_OK(SchemaToPB(tablet_schema, write_req.mutable_schema(), SCHEMA_PB_WITHOUT_IDS));
+
+    // Encode each row as a DELETE_IGNORE operation.
+    RowOperationsPBEncoder encoder(write_req.mutable_row_operations());
+    for (size_t row_idx : rows_to_delete) {
+      KuduPartialRow delete_row(&tablet_schema);
+      RowBlockRow row = block.row(row_idx);
+      // Copy all PK column values into the partial row.
+      for (int col_idx = 0; col_idx < projection.num_columns(); col_idx++) {
+        const ColumnSchema& col = projection.column(col_idx);
+        int tablet_col_idx = tablet_schema.find_column(col.name());
+        DCHECK_NE(tablet_col_idx, Schema::kColumnNotFound);
+        if (col.is_nullable() && row.is_null(col_idx)) {
+          CHECK_OK(delete_row.SetNull(tablet_col_idx));
+        } else {
+          const uint8_t* cell = row.cell_ptr(col_idx);
+          if (col.type_info()->physical_type() == BINARY) {
+            const Slice* slice_val = reinterpret_cast<const Slice*>(cell);
+            switch (col.type_info()->type()) {
+              case STRING:
+                CHECK_OK(delete_row.SetStringCopy(tablet_col_idx, *slice_val));
+                break;
+              case VARCHAR:
+                CHECK_OK(delete_row.SetVarchar(tablet_col_idx, *slice_val));
+                break;
+              default:
+                CHECK_OK(delete_row.SetBinaryCopy(tablet_col_idx, *slice_val));
+                break;
+            }
+          } else {
+            // For fixed-size types, copy the raw bytes.
+            switch (col.type_info()->type()) {
+              case BOOL:
+                CHECK_OK(delete_row.SetBool(tablet_col_idx,
+                                            *reinterpret_cast<const bool*>(cell)));
+                break;
+              case INT8:
+                CHECK_OK(delete_row.SetInt8(tablet_col_idx,
+                                            *reinterpret_cast<const int8_t*>(cell)));
+                break;
+              case INT16:
+                CHECK_OK(delete_row.SetInt16(tablet_col_idx,
+                                             *reinterpret_cast<const int16_t*>(cell)));
+                break;
+              case INT32:
+                CHECK_OK(delete_row.SetInt32(tablet_col_idx,
+                                             *reinterpret_cast<const int32_t*>(cell)));
+                break;
+              case INT64:
+                CHECK_OK(delete_row.SetInt64(tablet_col_idx,
+                                             *reinterpret_cast<const int64_t*>(cell)));
+                break;
+              case UNIXTIME_MICROS:
+                CHECK_OK(delete_row.SetUnixTimeMicros(tablet_col_idx,
+                                                      *reinterpret_cast<const int64_t*>(cell)));
+                break;
+              case DATE:
+                CHECK_OK(delete_row.SetDate(tablet_col_idx,
+                                            *reinterpret_cast<const int32_t*>(cell)));
+                break;
+              case FLOAT:
+                CHECK_OK(delete_row.SetFloat(tablet_col_idx,
+                                             *reinterpret_cast<const float*>(cell)));
+                break;
+              case DOUBLE:
+                CHECK_OK(delete_row.SetDouble(tablet_col_idx,
+                                              *reinterpret_cast<const double*>(cell)));
+                break;
+              case INT128:
+                CHECK_OK(delete_row.SetUnscaledDecimal(tablet_col_idx,
+                                              *reinterpret_cast<const int128_t*>(cell)));
+                break;
+              default:
+                LOG(DFATAL) << "Unexpected PK column type: " << col.type_info()->name();
+                return SetupErrorAndRespond(
+                    resp->mutable_error(),
+                    Status::InvalidArgument(
+                        Substitute("unsupported PK column type: $0", col.type_info()->name())),
+                    TabletServerErrorPB::UNKNOWN_ERROR,
+                    context);
+            }
+          }
+        }
+      }
+      encoder.Add(RowOperationsPB::DELETE_IGNORE, delete_row);
+    }
+
+    // Submit the write synchronously via the Raft path.
+    CountDownLatch latch(1);
+    WriteResponsePB write_resp;
+    unique_ptr<tablet::OpCompletionCallback> op_callback(
+        new LatchOpCompletionCallback<WriteResponsePB>(&latch, &write_resp));
+    unique_ptr<tablet::WriteOpState> op_state(
+        new tablet::WriteOpState(replica.get(),
+                                 &write_req,
+                                 nullptr,  // No RequestIdPB
+                                 &write_resp));
+    op_state->set_completion_callback(std::move(op_callback));
+
+    s = replica->SubmitWrite(std::move(op_state));
+    if (PREDICT_FALSE(!s.ok())) {
+      resp->set_rows_deleted(total_deleted);
+      return SetupErrorAndRespond(
+          resp->mutable_error(), s, TabletServerErrorPB::UNKNOWN_ERROR, context);
+    }
+    latch.Wait();
+
+    if (write_resp.has_error()) {
+      resp->set_rows_deleted(total_deleted);
+      return SetupErrorAndRespond(
+          resp->mutable_error(),
+          StatusFromPB(write_resp.error().status()),
+          write_resp.error().code(),
+          context);
+    }
+
+    // Count successful deletes (rows_to_delete minus per-row errors).
+    int64_t batch_deleted = rows_to_delete.size() - write_resp.per_row_errors_size();
+    total_deleted += batch_deleted;
+  }
+
+  // 11. Respond.
+  resp->set_rows_deleted(total_deleted);
+  resp->set_timestamp(server_->clock()->Now().ToUint64());
+  context->RespondSuccess();
 }
 
 ConsensusServiceImpl::ConsensusServiceImpl(ServerBase* server,

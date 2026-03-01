@@ -464,6 +464,16 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
       return toPB();
     }
 
+    /**
+     * Encode a single row as a RANGE_LOWER_BOUND operation. Used by
+     * DeleteByPkPrefixRequest to encode the PK prefix.
+     */
+    RowOperationsPB encodeSingleRow(PartialRow row, ChangeType type) {
+      init(row.getSchema(), 1);
+      encodeRow(row, type);
+      return toPB();
+    }
+
     public RowOperationsPB encodeLowerAndUpperBounds(PartialRow lowerBound,
                                                      PartialRow upperBound,
                                                      RangePartitionBound lowerBoundType,

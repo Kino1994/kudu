@@ -366,6 +366,45 @@ public class KuduClient implements AutoCloseable {
   }
 
   /**
+   * Delete all rows from a table whose primary key starts with the given prefix.
+   *
+   * <p>This is a convenience wrapper around {@link DeleteByPkPrefix#execute}.
+   * See that class for full documentation on semantics, consistency, and
+   * partition handling.
+   *
+   * @param table     the table to delete from
+   * @param pkPrefix  a {@link PartialRow} with a leading subset of the PK columns set
+   * @return a response containing the count of deleted rows
+   * @throws KuduException if an RPC error occurs
+   * @throws IllegalArgumentException if the prefix is invalid
+   */
+  public DeleteByPkPrefixResponse deleteByPkPrefix(
+      KuduTable table,
+      PartialRow pkPrefix) throws KuduException {
+    return DeleteByPkPrefix.execute(this, table, pkPrefix);
+  }
+
+  /**
+   * Delete all rows from a table whose primary key starts with the given prefix.
+   *
+   * @param table     the table to delete from
+   * @param pkPrefix  a {@link PartialRow} with a leading subset of the PK columns set
+   * @param limit     ignored; retained for backward compatibility
+   * @return a response containing the count of deleted rows
+   * @throws KuduException if an RPC error occurs
+   * @throws IllegalArgumentException if the prefix is invalid
+   * @deprecated Use {@link #deleteByPkPrefix(KuduTable, PartialRow)} instead.
+   *             The limit parameter is no longer enforced.
+   */
+  @Deprecated
+  public DeleteByPkPrefixResponse deleteByPkPrefix(
+      KuduTable table,
+      PartialRow pkPrefix,
+      long limit) throws KuduException {
+    return deleteByPkPrefix(table, pkPrefix);
+  }
+
+  /**
    * Start a new multi-row distributed transaction.
    * <p>
    * Start a new multi-row transaction and return a handle for the transactional
